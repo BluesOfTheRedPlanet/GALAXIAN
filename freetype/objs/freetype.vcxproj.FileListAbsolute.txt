@@ -1,0 +1,1 @@
+C:\Users\Eve\Documents\libraries\freetype-2.13.0\objs\x64\Release\freetype.dll

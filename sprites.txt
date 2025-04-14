@@ -1,0 +1,12 @@
+player,129,237,80,80
+essence,129,204,32,32
+enemy_3,0,204,128,128
+enemy_1,0,0,238,136
+enemy_2,0,137,84,66
+start_button,85,137,64,16
+quit_button,162,204,64,16
+normal_button,150,154,64,16
+levels_button,150,171,64,16
+hard_button,85,154,64,16
+easy_button,85,171,64,16
+explosion,239,0,405,327

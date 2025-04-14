@@ -1,0 +1,679 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <glew.h>
+#include <glfw3.h>
+#include <SOIL2.h>
+#include <time.h>
+#include <locale.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#define MAX_BULLETS 10
+
+// Определение макроса для проверки ошибок OpenGL
+#ifdef DEBUG
+#define CHECK_GL_ERROR() \
+    { \
+        GLenum error = glGetError(); \
+        if (error != GL_NO_ERROR) { \
+            printf("OpenGL error: %d\n", error); \
+        } \
+    }
+#else
+#define CHECK_GL_ERROR()
+#endif
+
+const char* vertexShaderSource = "#version 460 core\n"
+"layout (location = 0) in vec3 aPos;\n"
+"layout (location = 1) in vec2 aTexCoord;\n"
+"out vec2 TexCoord;\n"
+"void main()\n"
+"{\n"
+"   gl_Position = vec4(aPos, 1.0);\n"
+"   TexCoord = aTexCoord;\n"
+"}\0";
+
+const char* fragmentShaderSourceTexture = "#version 460 core\n"
+"out vec4 FragColor;\n"
+"in vec2 TexCoord;\n"
+"uniform sampler2D texture1;\n"
+"void main()\n"
+"{\n"
+"   FragColor = texture(texture1, TexCoord);\n"
+"   if (FragColor.a < 0.1) discard;\n" // Отбрасываем пиксели с низкой прозрачностью
+"}\n\0";
+
+const char* fragmentShaderSourceEnemy = "#version 460 core\n"
+"out vec4 FragColor;\n"
+"void main()\n"
+"{\n"
+"   FragColor = vec4(1.0, 0.0, 0.0, 1.0);\n" // Красный цвет для врагов
+"}\n\0";
+
+const char* fragmentShaderSourceBullet = "#version 460 core\n"
+"out vec4 FragColor;\n"
+"void main()\n"
+"{\n"
+"   FragColor = vec4(1.0, 1.0, 0.0, 1.0);\n" // Желтый цвет для пуль
+"}\n\0";
+
+const char* fragmentShaderSourceText = "#version 460 core\n"
+"out vec4 FragColor;\n"
+"in vec2 TexCoord;\n"
+"uniform sampler2D text;\n"
+"uniform vec3 textColor;\n"
+"void main()\n"
+"{\n"
+"   vec4 sampled = vec4(1.0, 1.0, 1.0, texture(text, TexCoord).r);\n"
+"   FragColor = vec4(textColor, 1.0) * sampled;\n"
+"}\n\0";
+
+// Структуры данных для игровых объектов
+typedef struct {
+    float x, y;
+    float width, height;
+    float spawnTime; // Время появления врага
+    int exploding; // Флаг взрыва
+    float explosionTime; // Время начала взрыва
+} GameObject;
+
+// Структура для врагов с дополнительным флагом взрыва
+typedef struct {
+    GameObject base; // Наследование от GameObject
+    int collided; // Флаг столкновения
+} Enemy;
+
+
+// Структура для пуль
+typedef struct {
+    float x, y;
+    float width, height;
+    int active; // Флаг активности пули
+} Bullet;
+
+// Глобальные переменные
+GLFWwindow* window;
+GameObject player;
+Enemy enemies[10];
+Bullet bullets[MAX_BULLETS];
+GLuint backgroundTexture, playerTexture, enemyTexture, explosionTexture;
+GLuint charTextures[128];
+unsigned int shaderProgramPlayer, shaderProgramEnemy, shaderProgramBullet, shaderProgramText, VAO, VBO;
+int score = 0;
+int playerHealth = 10;
+int numEnemies = 10;
+
+FT_Face face;
+FT_Library ft;
+
+void updateVertexBuffer(float x, float y, float width, float height);
+
+void APIENTRY glDebugOutput(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* userParam) {
+    printf("Debug message (%d): %s\n", id, message);
+}
+
+float getTime() {
+    return (float)glfwGetTime();
+}
+
+void setupViewport(int width, int height) {
+    glViewport(0, 0, width, height);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, width, height, 0.0); // Обрати внимание на порядок координат
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+}
+
+void initTextRendering() {
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (FT_Init_FreeType(&ft)) {
+        printf("Could not init FreeType Library\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (FT_New_Face(ft, "C:/Users/Eve/source/repos/GALAXIAN_GAME/fonts/arial.ttf", 0, &face)) {
+        printf("Failed to load font\n");
+        exit(EXIT_FAILURE);
+    }
+
+    FT_Set_Pixel_Sizes(face, 0, 48);
+
+    glGenTextures(128, charTextures);
+
+    for (unsigned char c = 0; c < 128; c++) {
+        if (FT_Load_Char(face, c, FT_LOAD_RENDER)) {
+            printf("Failed to load Glyph for character %c\n", c);
+            continue;
+        }
+        glBindTexture(GL_TEXTURE_2D, charTextures[c]);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RED,
+            face->glyph->bitmap.width,
+            face->glyph->bitmap.rows,
+            0,
+            GL_RED,
+            GL_UNSIGNED_BYTE,
+            face->glyph->bitmap.buffer
+        );
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+
+    printf("Text rendering initialized successfully\n");
+}
+
+void renderText(const char* text, float x, float y, float scale, GLuint* charTextures) {
+    glUseProgram(shaderProgramText); // Используем шейдер для текста
+    glUniform3f(glGetUniformLocation(shaderProgramText, "textColor"), 1.0f, 1.0f, 1.0f); // Цвет текста
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(VAO);
+
+    while (*text) {
+        char c = *text++;
+        glBindTexture(GL_TEXTURE_2D, charTextures[c]);
+
+        float xpos = x + face->glyph->bitmap_left * scale;
+        float ypos = y - (face->glyph->bitmap.rows - face->glyph->bitmap_top) * scale;
+
+        float w = face->glyph->bitmap.width * scale;
+        float h = face->glyph->bitmap.rows * scale;
+
+        updateVertexBuffer(xpos, ypos, w, h);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+        x += (face->glyph->advance.x >> 6) * scale; // Перемещаем позицию для следующего символа
+    }
+
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glfwSwapBuffers(window);
+}
+
+// Функция для загрузки текстуры с использованием SOIL2
+GLuint loadTexture(const char* path) {
+    GLuint textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    int width, height;
+    unsigned char* image = SOIL_load_image(path, &width, &height, 0, SOIL_LOAD_RGBA);
+    if (image) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
+        glGenerateMipmap(GL_TEXTURE_2D);
+
+        // Установка параметров текстуры
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+    else {
+        printf("Ошибка загрузки текстуры: %s\n", path);
+    }
+    SOIL_free_image_data(image);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    return textureID;
+}
+
+
+// Инициализация текстур
+void initTextures() {
+    backgroundTexture = loadTexture("C:\\Users\\Eve\\source\\repos\\GALAXIAN_GAME\\ASSETS\\bg.png");
+    playerTexture = loadTexture("C:\\Users\\Eve\\source\\repos\\GALAXIAN_GAME\\ASSETS\\player.png");
+    enemyTexture = loadTexture("C:\\Users\\Eve\\source\\repos\\GALAXIAN_GAME\\ASSETS\\enemy_1.png");
+    explosionTexture = loadTexture("C:\\Users\\Eve\\source\\repos\\GALAXIAN_GAME\\ASSETS\\explosion.png");
+}
+
+// Функции для инициализации игровых объектов
+void initGameObjects() {
+    player.x = 375.0f;
+    player.y = 50.0f;
+    player.width = 50.0f;
+    player.height = 50.0f;
+
+    srand((unsigned int)time(NULL)); // Инициализация генератора случайных чисел
+
+    for (int i = 0; i < numEnemies; i++) {
+        enemies[i].base.x = (float)(rand() % 950); // Случайная позиция по x
+        enemies[i].base.y = 1000.0f; // Начальная позиция по y
+        enemies[i].base.width = 50.0f;
+        enemies[i].base.height = 50.0f;
+        enemies[i].base.spawnTime = (float)(rand() % 3000) / 1000.0f; // Случайное время появления (0-3 секунды)
+        enemies[i].base.exploding = 0; // Враг не взрывается
+        enemies[i].base.explosionTime = 0.0f; // Время начала взрыва
+    }
+}
+
+// Инициализация пуль
+void initBullets() {
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        bullets[i].width = 5.0f;
+        bullets[i].height = 10.0f;
+        bullets[i].active = 0; // Пуля неактивна
+    }
+}
+
+// Отрисовка пуль
+void drawBullets() {
+    glUseProgram(shaderProgramBullet);
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].active) {
+            updateVertexBuffer(bullets[i].x, bullets[i].y, bullets[i].width, bullets[i].height);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            CHECK_GL_ERROR();
+        }
+    }
+}
+
+// Функция обновления пуль
+void updateBullets() {
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].active) {
+            bullets[i].y += 5.0f; // Двигаем пулю вверх
+            if (bullets[i].y > 1000.0f) {
+                bullets[i].active = 0; // Деактивируем пулю, если она вышла за верхнюю границу
+            }
+        }
+    }
+}
+
+// Проверка столкновения пуль с врагами
+void checkBulletCollisions(float currentTime) {
+    for (int i = 0; i < MAX_BULLETS; i++) {
+        if (bullets[i].active) {
+            for (int j = 0; j < numEnemies; j++) {
+                if (checkCollision((GameObject) { bullets[i].x, bullets[i].y, bullets[i].width, bullets[i].height, 0.0f }, (GameObject) { enemies[j].base.x, enemies[j].base.y, enemies[j].base.width, enemies[j].base.height, 0.0f })) {
+                    bullets[i].active = 0; // Деактивируем пулю
+                    enemies[j].base.exploding = 1; // Враг взрывается
+                    enemies[j].base.explosionTime = currentTime; // Устанавливаем время начала взрыва
+                    score += 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Функция обновления врагов
+void updateEnemies(float deltaTime) {
+    static float elapsedTime = 0.0f;
+    elapsedTime += deltaTime;
+
+    for (int i = 0; i < numEnemies; i++) {
+        if (elapsedTime >= enemies[i].base.spawnTime) {
+            enemies[i].base.y -= 1.0f; // Двигаем врагов вниз
+            if (enemies[i].base.y < 0.0f) {
+                int overlap;
+                do {
+                    overlap = 0;
+                    enemies[i].base.x = (float)(rand() % 950); // Случайная позиция по x
+                    enemies[i].base.y = 1000.0f; // Начальная позиция по y
+                    enemies[i].base.spawnTime = elapsedTime + (float)(rand() % 3000) / 1000.0f; // Новое случайное время появления
+                    enemies[i].collided = 0; // Сбрасываем флаг столкновения
+
+                    // Проверка на наложение с другими врагами
+                    for (int j = 0; j < numEnemies; j++) {
+                        if (i != j && checkCollision(enemies[i].base, enemies[j].base)) {
+                            overlap = 1;
+                            break;
+                        }
+                    }
+                } while (overlap);
+            }
+        }
+    }
+}
+
+// Проверка столкновений
+int checkCollision(GameObject a, GameObject b) {
+    return (a.x < b.x + b.width &&
+        a.x + a.width > b.x &&
+        a.y < b.y + b.height &&
+        a.y + a.height > b.y);
+}
+
+void checkCollisions() {
+    for (int i = 0; i < numEnemies; i++) {
+        if (checkCollision(player, enemies[i].base)) {
+            if (!enemies[i].collided) {
+                printf("Столкновение с врагом!\n");
+                playerHealth -= 1; // Уменьшаем здоровье героя
+                enemies[i].collided = 1; // Устанавливаем флаг столкновения
+            }
+        }
+        else {
+            enemies[i].collided = 0; // Сбрасываем флаг столкновения, если враг больше не касается героя
+        }
+    }
+}
+
+// Функция для инициализации шейдеров и буферов
+unsigned int shaderProgramPlayer, shaderProgramEnemy, shaderProgramBullet;
+
+void initShadersAndBuffers() {
+    // Компиляция вершинного шейдера
+    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
+    glCompileShader(vertexShader);
+    // Проверка ошибок компиляции
+    int success;
+    char infoLog[512];
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+        printf("Ошибка компиляции вершинного шейдера: %s\n", infoLog);
+    }
+
+    // Компиляция фрагментного шейдера для текстур
+    unsigned int fragmentShaderTexture = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShaderTexture, 1, &fragmentShaderSourceTexture, NULL);
+    glCompileShader(fragmentShaderTexture);
+    // Проверка ошибок компиляции
+    glGetShaderiv(fragmentShaderTexture, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fragmentShaderTexture, 512, NULL, infoLog);
+        printf("Ошибка компиляции фрагментного шейдера для текстур: %s\n", infoLog);
+    }
+
+    // Компиляция фрагментного шейдера для текста
+    unsigned int fragmentShaderText = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShaderText, 1, &fragmentShaderSourceText, NULL);
+    glCompileShader(fragmentShaderText);
+    // Проверка ошибок компиляции
+    glGetShaderiv(fragmentShaderText, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fragmentShaderText, 512, NULL, infoLog);
+        printf("Ошибка компиляции фрагментного шейдера для текста: %s\n", infoLog);
+    }
+
+    // Связывание шейдеров в программу для игрока
+    shaderProgramPlayer = glCreateProgram();
+    glAttachShader(shaderProgramPlayer, vertexShader);
+    glAttachShader(shaderProgramPlayer, fragmentShaderTexture);
+    glLinkProgram(shaderProgramPlayer);
+    // Проверка ошибок связывания
+    glGetProgramiv(shaderProgramPlayer, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shaderProgramPlayer, 512, NULL, infoLog);
+        printf("Ошибка связывания шейдерной программы для игрока: %s\n", infoLog);
+    }
+
+    // Связывание шейдеров в программу для врагов
+    shaderProgramEnemy = glCreateProgram();
+    glAttachShader(shaderProgramEnemy, vertexShader);
+    glAttachShader(shaderProgramEnemy, fragmentShaderTexture);
+    glLinkProgram(shaderProgramEnemy);
+    // Проверка ошибок связывания
+    glGetProgramiv(shaderProgramEnemy, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shaderProgramEnemy, 512, NULL, infoLog);
+        printf("Ошибка связывания шейдерной программы для врагов: %s\n", infoLog);
+    }
+
+    // Связывание шейдеров в программу для текста
+    shaderProgramText = glCreateProgram();
+    glAttachShader(shaderProgramText, vertexShader);
+    glAttachShader(shaderProgramText, fragmentShaderText);
+    glLinkProgram(shaderProgramText);
+    // Проверка ошибок связывания
+    glGetProgramiv(shaderProgramText, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(shaderProgramText, 512, NULL, infoLog);
+        printf("Ошибка связывания шейдерной программы для текста: %s\n", infoLog);
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShaderTexture);
+    glDeleteShader(fragmentShaderText);
+
+    // Создание вершинного буфера и массива вершин
+    float vertices[] = {
+        // координаты вершин и текстурные координаты
+        -0.5f, -0.5f, 0.0f, 0.0f, 0.0f,
+         0.5f, -0.5f, 0.0f, 1.0f, 0.0f,
+         0.5f,  0.5f, 0.0f, 1.0f, 1.0f,
+        -0.5f,  0.5f, 0.0f, 0.0f, 1.0f
+    };
+
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+
+    glBindVertexArray(VAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_DYNAMIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+
+// Функция для обновления буфера вершин
+void updateVertexBuffer(float x, float y, float width, float height) {
+    float vertices[] = {
+        x / 500.0f - 1.0f, y / 500.0f - 1.0f, 0.0f, 0.0f, 1.0f,
+        (x + width) / 500.0f - 1.0f, y / 500.0f - 1.0f, 0.0f, 1.0f, 1.0f,
+        (x + width) / 500.0f - 1.0f, (y + height) / 500.0f - 1.0f, 0.0f, 1.0f, 0.0f,
+        x / 500.0f - 1.0f, (y + height) / 500.0f - 1.0f, 0.0f, 0.0f, 0.0f
+    };
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// Функция для отрисовки игровых объектов
+void drawGameObjects(float currentTime) {
+    // Очистка буфера
+    glClear(GL_COLOR_BUFFER_BIT);
+    CHECK_GL_ERROR();
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glBindVertexArray(VAO);
+
+    // Отрисовка фона
+    glUseProgram(shaderProgramPlayer);
+    glBindTexture(GL_TEXTURE_2D, backgroundTexture);
+    updateVertexBuffer(0, 0, 1000, 1000);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    CHECK_GL_ERROR();
+
+    // Отрисовка игрока
+    glUseProgram(shaderProgramPlayer);
+    glBindTexture(GL_TEXTURE_2D, playerTexture);
+    updateVertexBuffer(player.x, player.y, player.width, player.height);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    CHECK_GL_ERROR();
+
+    // Отрисовка врагов
+    glUseProgram(shaderProgramEnemy);
+    for (int i = 0; i < numEnemies; i++) {
+        if (enemies[i].base.exploding) {
+            if (currentTime - enemies[i].base.explosionTime < 1.0f) {
+                glBindTexture(GL_TEXTURE_2D, explosionTexture);
+            }
+            else {
+                enemies[i].base.y = -100.0f; // Перемещаем врага за пределы экрана после взрыва
+                enemies[i].base.exploding = 0; // Сбрасываем флаг взрыва
+                continue;
+            }
+        }
+        else {
+            glBindTexture(GL_TEXTURE_2D, enemyTexture);
+        }
+        updateVertexBuffer(enemies[i].base.x, enemies[i].base.y, enemies[i].base.width, enemies[i].base.height);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        CHECK_GL_ERROR();
+    }
+
+    // Отрисовка пуль
+    drawBullets();
+
+    // Обновление окна
+    glfwSwapBuffers(window);
+    CHECK_GL_ERROR();
+}
+
+// Функция для обработки ввода с клавиатуры
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+        switch (key) {
+        case GLFW_KEY_A:
+            player.x -= 10.0f;
+            break;
+        case GLFW_KEY_D:
+            player.x += 10.0f;
+            break;
+        case GLFW_KEY_SPACE:
+            // Стрельба
+            for (int i = 0; i < MAX_BULLETS; i++) {
+                if (!bullets[i].active) {
+                    bullets[i].x = player.x + player.width / 2 - bullets[i].width / 2;
+                    bullets[i].y = player.y + player.height;
+                    bullets[i].active = 1; // Пуля активна
+                    break;
+                }
+            }
+            break;
+        case GLFW_KEY_ESCAPE:
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+            break;
+        }
+    }
+}
+
+
+// Функция для инициализации GLFW и создания окна
+GLFWwindow* initWindow(int width, int height, const char* title) {
+    if (!glfwInit()) {
+        printf("Ошибка инициализации GLFW\n");
+        return NULL;
+    }
+
+    // Установка версии OpenGL и профиля контекста
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE); // Включение двойной буферизации
+
+    GLFWwindow* window = glfwCreateWindow(width, height, title, NULL, NULL);
+    if (!window) {
+        printf("Ошибка создания окна GLFW\n");
+        glfwTerminate();
+        return NULL;
+    }
+    setupViewport(1000, 1000);
+
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0); // Отключение V-Sync
+
+    //glClearColor(0.8f, 0.3f, 0.3f, 1.0f); // Цвет фона
+    //glClear(GL_COLOR_BUFFER_BIT);
+
+    // Инициализация GLEW
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) {
+        printf("Ошибка инициализации GLEW\n");
+        return NULL;
+    }
+
+    return window;
+}
+
+
+int main() {
+    setlocale(LC_ALL, "Rus");
+
+    // Объявление функции checkCollision
+    int checkCollision(GameObject a, GameObject b);
+
+    // Инициализация окна
+    window = initWindow(1000, 1000, "Galaxian");
+    if (!window) {
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0); // Отключение V-Sync
+
+    // Инициализация GLEW
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) {
+        printf("Ошибка инициализации GLEW\n");
+        return -1;
+    }
+
+    if (FT_Init_FreeType(&ft)) {
+        printf("Could not init FreeType Library\n");
+        return -1;
+    }
+
+
+    if (FT_New_Face(ft, "C:/Users/Eve/source/repos/GALAXIAN_GAME/fonts/arial.ttf", 0, &face)) {
+        printf("Failed to load font\n");
+        return -1;
+    }
+
+    FT_Set_Pixel_Sizes(face, 0, 48);
+
+    glEnable(GL_DEBUG_OUTPUT);
+    glDebugMessageCallback(glDebugOutput, NULL);
+
+    initBullets();
+    initGameObjects();
+
+    initShadersAndBuffers();
+    initTextures();
+    initTextRendering();
+
+    glfwSetKeyCallback(window, key_callback);
+
+    float lastTime = getTime();
+
+    // Основной цикл
+    while (!glfwWindowShouldClose(window)) {
+        float currentTime = getTime();
+        float deltaTime = currentTime - lastTime;
+        lastTime = currentTime;
+
+        // Обновление игровых объектов
+        updateEnemies(deltaTime);
+        updateBullets();
+
+        checkCollisions();
+        checkBulletCollisions(currentTime);
+
+        drawGameObjects(currentTime);
+
+        char scoreText[32];
+        sprintf(scoreText, "Score: %d", score);
+        renderText(scoreText, 10.0f, 950.0f, 1.0f, charTextures);
+
+        char healthText[32];
+        sprintf(healthText, "Health: %d", playerHealth);
+        renderText(healthText, 10.0f, 900.0f, 1.0f, charTextures);
+
+        // Обработка событий
+        glfwPollEvents();
+    }
+    // Завершение работы GLFW
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
